@@ -1,0 +1,10 @@
+The INT8 DSpark patch and gemv_q8.py derive from
+https://github.com/sxuff/inkling-2-mini-spark (Apache-2.0), which builds on
+vLLM (Apache-2.0, copyright the vLLM contributors).
+
+Pinned source blobs:
+  gemv_q8.py: ef0b1d7acc447c7eba0d07a1292e78d706bf9fb1
+  DSpark patch: 70ef21a91858e6797f702b6188cfff3e620096c8
+
+The DSpark hunks are applied with exact context checks and composed with
+this project's Thor cache-writer fix. No model weights are redistributed.

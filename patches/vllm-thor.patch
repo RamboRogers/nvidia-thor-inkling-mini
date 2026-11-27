@@ -1,0 +1,1524 @@
+diff --git a/entrypoints/openai/chat_completion/protocol.py b/entrypoints/openai/chat_completion/protocol.py
+index ff007a0..fb7d2a2 100644
+--- a/entrypoints/openai/chat_completion/protocol.py
++++ b/entrypoints/openai/chat_completion/protocol.py
+@@ -820,7 +820,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             ),
+             stream_interval=self.stream_interval,
+             structured_outputs=self.extract_structured_outputs(),
+-            logit_bias=self.logit_bias,
++            logit_bias=(
++                {"200008": -100, **(self.logit_bias or {})}
++                if self.model == "inkling-mini" and self.reasoning_effort == "none"
++                and self.thinking_token_budget is None else self.logit_bias
++            ),
+             bad_words=self.bad_words,
+             thinking_token_budget=self.thinking_token_budget,
+             allowed_token_ids=self.allowed_token_ids,
+diff --git a/entrypoints/openai/chat_completion/serving.py b/entrypoints/openai/chat_completion/serving.py
+index 81b0ac1..b855046 100644
+--- a/entrypoints/openai/chat_completion/serving.py
++++ b/entrypoints/openai/chat_completion/serving.py
+@@ -32,6 +32,7 @@ from vllm.entrypoints.openai.chat_completion.message_assembly import (
+     get_echo_content,
+ )
+ from vllm.entrypoints.openai.chat_completion.protocol import (
++    ChatCompletionNamedToolChoiceParam,
+     ChatCompletionLogProb,
+     ChatCompletionLogProbs,
+     ChatCompletionLogProbsContent,
+@@ -78,6 +79,64 @@ from vllm.utils.serial_utils import numpy2base64
+ logger = init_logger(__name__)
+ 
+ 
++def _inkling_full_finish_reason(engine_reason, request, message):
++    """Local full-chat convention for one already-parsed, valid named call."""
++    stock = resolve_finish_reason(engine_reason, request, bool(message.tool_calls))
++    if (stock != "stop" or engine_reason != "stop" or request.model != "inkling-mini"
++            or not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
++            or message.role != "assistant" or len(message.tool_calls) != 1):
++        return stock
++    name = request.tool_choice.function.name
++    call = message.tool_calls[0]
++    if (not name.strip() or call.type != "function" or not call.id.strip()
++            or call.function.name != name):
++        return stock
++    declared = [t.function for t in request.tools or [] if t.type == "function" and t.function.name == name]
++    if len(declared) != 1:
++        return stock
++
++    # Only the audited flat object-schema subset. Don't introduce schema URL
++    # retrieval, arbitrary regex evaluation or recursive validation into serving.
++    schema = declared[0].parameters
++    if not isinstance(schema, dict) or schema.get("type") != "object" or schema.keys() - {
++        "type", "title", "description", "properties", "required", "additionalProperties"
++    } or not isinstance(schema.get("additionalProperties", True), bool):
++        return stock
++    props = schema.get("properties", {})
++    if not isinstance(props, dict) or len(props) > 128 or any(
++        not isinstance(prop, dict) or prop.keys() - {"type", "title", "description"}
++        or prop.get("type") not in ("string", "integer", "number", "boolean", "null")
++        for prop in props.values()
++    ):
++        return stock
++    args = call.function.arguments
++    if len(args) > 65536:
++        return stock
++
++    import json
++    from decimal import Decimal, InvalidOperation
++    from jsonschema import Draft202012Validator, SchemaError
++
++    def reject_constant(_):
++        raise ValueError("non-JSON constant")
++
++    def unique(pairs):
++        obj = dict(pairs)
++        if len(pairs) != len(obj):
++            raise ValueError("duplicate key")
++        return obj
++
++    try:
++        parsed = json.loads(args, parse_constant=reject_constant, object_pairs_hook=unique,
++                            parse_float=Decimal)
++        Draft202012Validator.check_schema(schema)
++        if isinstance(parsed, dict) and Draft202012Validator(schema).is_valid(parsed):
++            return "tool_calls"
++    except (ValueError, RecursionError, InvalidOperation, SchemaError):
++        pass
++    return stock
++
++
+ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
+     """Sum per-modality placeholder tokens from `mm_placeholders`.
+ 
+@@ -1076,9 +1135,7 @@ class OpenAIServingChat(GenerateBaseServing):
+                 index=output.index,
+                 message=message,
+                 logprobs=logprobs,
+-                finish_reason=resolve_finish_reason(
+-                    output.finish_reason, request, bool(message.tool_calls)
+-                ),
++                finish_reason=_inkling_full_finish_reason(output.finish_reason, request, message),
+                 stop_reason=output.stop_reason,
+                 token_ids=(
+                     as_list(output.token_ids)
+diff --git a/models/inkling2/nvidia/attention.py b/models/inkling2/nvidia/attention.py
+index 7d4f950..cd279df 100644
+--- a/models/inkling2/nvidia/attention.py
++++ b/models/inkling2/nvidia/attention.py
+@@ -50,7 +50,21 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
+ 
+ from ..configs import Inkling2ModelConfig
+ from .lora import add_linear_lora
++import os
++
+ from .ops import use_sm100_kernels
++from .ops import thor_bf16x
++
++
++def _thor_fa4_prefill(is_local: bool) -> bool:
++    if not current_platform.is_device_capability_family(110):
++        return False
++    mode = os.environ.get("INKLING2_THOR_FA4_PREFILL", "0").lower()
++    if mode in ("1", "all", "true"):
++        return True
++    if mode == "global":
++        return not is_local
++    return False
+ from .ops.attention import (
+     _INKLING2_FA4_REL_ATTENTION_KERNEL,
+     gate_sink,
+@@ -303,11 +317,43 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         if prefix in forward_context:
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         forward_context[prefix] = self
+-        if vllm_config.kernel_config.enable_jit_warmup and use_sm100_kernels():
++        if vllm_config.kernel_config.enable_jit_warmup and (use_sm100_kernels() or _thor_fa4_prefill(is_local)):
+             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
+ 
+     def process_weights_after_loading(self) -> None:
+         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
++        self._thor_qkvr_pack = None
++        self._thor_qkvr_wide = None
++        self._thor_wo_pack = None
++        self._thor_wo_wide = None
++        self._thor_reordered_splits = None
++        self._thor_kv_regions = None
++        if (
++            thor_bf16x.dense_enabled()
++            and get_tensor_model_parallel_world_size() == 1
++            and self.qkvr.weight.dtype == torch.bfloat16
++            and self.wo_ud.weight.dtype == torch.bfloat16
++            and self.qkvr.weight.is_cuda
++        ):
++            s = self.split_sizes
++            q_sz, r_sz, g_sz, snk_sz, k_sz, v_sz = s[0], s[1], s[2], s[3], s[4], s[5]
++            extra = s[6:] if len(s) > 6 else []
++            chunks = self.qkvr.weight.split(s, dim=0)
++            reordered_w = torch.cat(
++                [chunks[0], chunks[4], chunks[5], chunks[1], chunks[2], chunks[3], *chunks[6:]],
++                dim=0,
++            ).contiguous()
++            self._thor_reordered_splits = [q_sz, k_sz, v_sz, r_sz, g_sz, snk_sz, *extra]
++            self._thor_kv_regions = (q_sz, q_sz + k_sz, q_sz + k_sz + v_sz)
++            verify_now = self.prefix.endswith(".layers.0.attn")
++            self._thor_qkvr_pack, self._thor_qkvr_wide = thor_bf16x.pack_weight(
++                reordered_w, f"{self.prefix}.qkvr", "qkvr", verify=verify_now
++            )
++            if self._thor_qkvr_wide.fmt == 2:
++                self._thor_qkvr_wide.weight = self.qkvr.weight
++            self._thor_wo_pack, self._thor_wo_wide = thor_bf16x.pack_weight(
++                self.wo_ud.weight, f"{self.prefix}.wo_ud", "wo", verify=verify_now
++            )
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return Inkling2AttentionBackend
+@@ -333,6 +379,24 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
+         # forward), so the LoRA deltas are added here (no-op without LoRA).
+         weight = self.qkvr.weight
++        if self._thor_qkvr_wide is not None and x_q.dim() == 2:
++            m = x_q.shape[0]
++            if x_k is x_q and x_v is x_q and 0 < m <= 96:
++                if m <= 15:
++                    out = thor_bf16x.pico_linear(x_q, self._thor_qkvr_pack, torch.bfloat16, tag="qkvr_pico")
++                else:
++                    out = thor_bf16x.wide_linear(x_q, self._thor_qkvr_wide, torch.bfloat16, tag="qkvr_wide")
++                q, k, v, r, gate, sinks = out.split(self._thor_reordered_splits, dim=-1)[:6]
++                return [q, r, gate, sinks, k, v]
++            if (x_k is not x_q or x_v is not x_q) and 0 < m <= 96:
++                out = thor_bf16x.wide_stacked(
++                    x_q, x_k, x_v, self._thor_qkvr_wide, self._thor_kv_regions, tag="qkvr_stacked"
++                )
++                q_lo, v_lo, v_hi = self._thor_kv_regions
++                q, _, _, r, gate, sinks = out[:m].split(self._thor_reordered_splits, dim=-1)[:6]
++                k = out[m : 2 * m, q_lo:v_lo]
++                v = out[2 * m : 3 * m, v_lo:v_hi]
++                return [q, r, gate, sinks, k, v]
+         if x_k is x_q and x_v is x_q:
+             projected = linear(x_q, weight)
+             add_linear_lora(self.qkvr, projected, x_q, range(6))
+@@ -395,7 +459,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             output,
+             pass_idx,
+         )
+-        out = linear(output, self.wo_ud.weight, out)
++        if self._thor_wo_wide is not None and output.dim() == 2 and 0 < output.shape[0] <= 48:
++            if output.shape[0] <= 16:
++                out = thor_bf16x.pico_linear(output, self._thor_wo_pack, torch.bfloat16, out=out, tag="wo_pico")
++            else:
++                out = thor_bf16x.wide_linear(output, self._thor_wo_wide, torch.bfloat16, out=out, tag="wo_wide")
++        else:
++            out = linear(output, self.wo_ud.weight, out)
+         add_linear_lora(self.wo_ud, out, output)
+         return out
+ 
+@@ -607,7 +677,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         if num_decodes:
+             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
+         key_cache, value_cache = self._split_kv_cache(kv_cache)
+-        if not use_sm100_kernels():
++        if not (use_sm100_kernels() or (_thor_fa4_prefill(self.is_local) and not self.fp8_kv)):
+             rel_attention(
+                 q[:nt],
+                 key_cache,
+diff --git a/models/inkling2/nvidia/dspark.py b/models/inkling2/nvidia/dspark.py
+index 6e1755a..0c6d686 100644
+--- a/models/inkling2/nvidia/dspark.py
++++ b/models/inkling2/nvidia/dspark.py
+@@ -1,10 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Modified for the inkling-2-mini-gb10 recipe (2026-11-21): optional 8-bit copies of the
++# draft-only weights (shared LM head, Markov fold, draft layers), INKLING2_DRAFT_QUANT.
+ """Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
+ through a small dense transformer over DFlare-mixed target-feature K/V, then a
+ recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
+ implementation's draft (flashinfer RMSNorms, bf16 logits)."""
+ 
++import os
+ from collections.abc import Iterable
+ from typing import cast
+ 
+@@ -47,9 +50,21 @@ from .ops.dspark import (
+     rope_,
+     silu_and_mul,
+ )
++from .ops.gemv_q8 import MAX_M as Q8_MAX_M
++from .ops.gemv_q8 import draft_quant_mode, gemv_q8, quantize_rows
+ from .ops.linear import linear
+ 
+ 
++def _draft_linear(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
++    """`linear` on the module's bf16 weight, or on its 8-bit copy (draft-only
++    weights, `INKLING2_DRAFT_QUANT`) for low-M batches. The target verifies
++    every draft token with its own weights, so only acceptance can change."""
++    q8 = getattr(module, "q8", None)
++    if q8 is not None and 0 < x.numel() // x.shape[-1] <= Q8_MAX_M:
++        return gemv_q8(x, *q8)
++    return linear(x, module.weight)
++
++
+ class _RMSNorm(nn.Module):
+     def __init__(self, hidden_size: int, eps: float) -> None:
+         super().__init__()
+@@ -188,13 +203,21 @@ class Inkling2DraftSelfAttention(nn.Module):
+     def _write_kv(
+         self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
+     ) -> None:
+-        impl = cast(FlashAttentionImpl, self.attn.impl)
+-        impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
++        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
++            triton_reshape_and_cache_flash,
++        )
++        key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
++            self.head_dim, dim=-1
++        )
++        triton_reshape_and_cache_flash(
++            k, v, key_cache, value_cache, slot_mapping,
++            self.attn.kv_cache_dtype, self.attn._k_scale, self.attn._v_scale,
++        )
+ 
+     def forward(
+         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
+     ) -> torch.Tensor:
+-        qkv = linear(x, self.qkv_proj.weight)
++        qkv = _draft_linear(x, self.qkv_proj)
+         qk_norm_rope_(
+             qkv,
+             positions,
+@@ -244,7 +267,7 @@ class Inkling2DraftSelfAttention(nn.Module):
+                 window=self.window,
+                 num_splits=num_splits,
+             )
+-        return linear(out, self.o_proj.weight)
++        return _draft_linear(out, self.o_proj)
+ 
+     def store_context_kv(
+         self,
+@@ -253,7 +276,7 @@ class Inkling2DraftSelfAttention(nn.Module):
+         cos_sin_cache: torch.Tensor,
+         slot_mapping: torch.Tensor | None,
+     ) -> None:
+-        k, v = linear(context, self.kv_proj_ctx.weight).split(
++        k, v = _draft_linear(context, self.kv_proj_ctx).split(
+             [self.kv_size, self.kv_size], -1
+         )
+         k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
+@@ -282,8 +305,8 @@ class Inkling2DraftMLP(nn.Module):
+         )
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        x = silu_and_mul(linear(x, self.gate_up_proj.weight))
+-        return linear(x, self.down_proj.weight)
++        x = silu_and_mul(_draft_linear(x, self.gate_up_proj))
++        return _draft_linear(x, self.down_proj)
+ 
+ 
+ class Inkling2DraftLayer(nn.Module):
+@@ -343,6 +366,8 @@ class Inkling2MarkovHead(nn.Module):
+         self.fold_weight: torch.Tensor | None = None
+         self.fold_bias: torch.Tensor | None = None
+         self.rnn_bias: torch.Tensor | None = None
++        # 8-bit copy of fold_weight (INKLING2_DRAFT_QUANT): (values, row scales).
++        self.fold_q8: tuple[torch.Tensor, torch.Tensor] | None = None
+ 
+     @torch.no_grad()
+     def fold(self, lm_head_weight: torch.Tensor) -> None:
+@@ -382,6 +407,11 @@ class Inkling2MarkovHead(nn.Module):
+         weight = self.rnn_proj.weight[:, : 2 * self.markov_rank]
+         raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
+         state, latent = markov_gate(raw, state)
++        if self.fold_q8 is not None and latent.shape[0] <= Q8_MAX_M:
++            fb = getattr(self, "fold_bias_hot", None)
++            if fb is None:
++                fb = self.fold_bias
++            return state, gemv_q8(latent, *self.fold_q8, bias=fb)
+         return state, torch.addmm(self.fold_bias, latent, self.fold_weight.T)
+ 
+ 
+@@ -481,6 +511,11 @@ class Inkling2DSparkModel(nn.Module):
+             config, vllm_config.model_config.max_model_len, f"{prefix}model"
+         )
+         self.lm_head: nn.Module | None = None
++        # 8-bit copy of the shared LM head for the draft's base logits.
++        self.lm_head_q8: tuple[torch.Tensor, torch.Tensor] | None = None
++        self._hot_ids: torch.Tensor | None = None
++        self._hot_scatter_buf: torch.Tensor | None = None
++        self._max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+ 
+     @torch.no_grad()
+     def attach_target(self, target_model: nn.Module) -> None:
+@@ -502,6 +537,55 @@ class Inkling2DSparkModel(nn.Module):
+         head = self.model.markov_head
+         assert head.rnn_bias is not None
+         head.fold(self.lm_head.weight)
++        mode = draft_quant_mode()
++        hot_n = int(os.environ.get("INKLING2_DRAFT_HOTVOCAB", "0") or "0")
++        if mode is not None and hot_n > 0 and get_tensor_model_parallel_world_size() == 1:
++            import json
++            hot_path = os.environ.get(
++                "INKLING2_DRAFT_HOTVOCAB_FILE",
++                "/opt/thor-opt/inkling_draftbytes/hotvocab/inkling2-mini-hot-r2.json",
++            )
++            ranked = json.loads(open(hot_path).read())
++            vocab = self.config.vocab_size
++            special = [i for i in range(200000, min(vocab, 200058))]
++            seen = set(special)
++            chosen = list(special)
++            for tid in ranked:
++                if 0 <= tid < vocab and tid not in seen:
++                    chosen.append(tid)
++                    seen.add(tid)
++                    if len(chosen) >= hot_n:
++                        break
++            chosen.sort()
++            self._hot_ids = torch.tensor(chosen, dtype=torch.int64, device=self.lm_head.weight.device)
++            self._hot_scatter_buf = torch.full(
++                (self._max_num_reqs, vocab),
++                float("-inf"),
++                dtype=self.lm_head.weight.dtype,
++                device=self.lm_head.weight.device,
++            )
++            self.lm_head_q8 = quantize_rows(self.lm_head.weight[self._hot_ids], mode, self.lm_head_q8)
++            assert head.fold_weight is not None and head.fold_bias is not None
++            head.fold_q8 = quantize_rows(head.fold_weight[self._hot_ids], mode, head.fold_q8)
++            head.fold_bias_hot = head.fold_bias[self._hot_ids].contiguous()
++        elif mode is not None:
++            self._hot_ids = None
++            self._hot_scatter_buf = None
++            head.fold_bias_hot = None
++            self.lm_head_q8 = quantize_rows(self.lm_head.weight, mode, self.lm_head_q8)
++            assert head.fold_weight is not None
++            head.fold_q8 = quantize_rows(head.fold_weight, mode, head.fold_q8)
++            if os.environ.get("INKLING2_DRAFT_QUANT_LAYERS", "0") == "1":
++                for layer in self.model.layers:
++                    attn, mlp = layer.self_attn, layer.mlp
++                    for mod in (
++                        attn.qkv_proj,
++                        attn.o_proj,
++                        attn.kv_proj_ctx,
++                        mlp.gate_up_proj,
++                        mlp.down_proj,
++                    ):
++                        mod.q8 = quantize_rows(mod.weight, mode, getattr(mod, "q8", None))
+         head.rnn_bias.copy_(head.rnn_proj.bias)
+         self.model.fuse_alpha.copy_(
+             torch.softmax(self.model.fuse_weight.float(), dim=-1)
+@@ -542,8 +626,11 @@ class Inkling2DSparkModel(nn.Module):
+         return self.model(input_ids, positions)
+ 
+     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
++        """TP-local bf16 base logits (bf16 GEMM, as the reference; or the
++        8-bit head copy with INKLING2_DRAFT_QUANT)."""
+         assert self.lm_head is not None
++        if self.lm_head_q8 is not None and 0 < hidden_states.shape[0] <= Q8_MAX_M:
++            return gemv_q8(hidden_states, *self.lm_head_q8)
+         return linear(hidden_states, self.lm_head.weight)
+ 
+     def markov_step(
+@@ -552,18 +639,32 @@ class Inkling2DSparkModel(nn.Module):
+         """Advance the recurrent head; return the state and TP-local bias."""
+         return self.model.markov_head.step(state, prev_tokens, context)
+ 
++    def markov_logits_and_compact(
++        self, base_logits: torch.Tensor, bias: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Return (full_vocab_logits, compact_logits_for_vcap)."""
++        compact = add_softcap(base_logits, bias, self.config.final_logit_softcapping)
++        if self._hot_ids is not None and compact.shape[-1] == self._hot_ids.shape[0]:
++            assert self._hot_scatter_buf is not None
++            buf = self._hot_scatter_buf[: compact.shape[0]]
++            buf.index_copy_(1, self._hot_ids, compact)
++            return buf, compact
++        full = tensor_model_parallel_all_gather(compact)[:, : self.config.vocab_size]
++        return full, full
++
+     def markov_logits(
+         self, base_logits: torch.Tensor, bias: torch.Tensor
+     ) -> torch.Tensor:
+         """Full-vocab softcapped logits."""
+-        logits = add_softcap(base_logits, bias, self.config.final_logit_softcapping)
+-        logits = tensor_model_parallel_all_gather(logits)
+-        return logits[:, : self.config.vocab_size]
++        return self.markov_logits_and_compact(base_logits, bias)[0]
+ 
+     def markov_argmax(
+         self, base_logits: torch.Tensor, bias: torch.Tensor
+     ) -> torch.Tensor:
+         """`markov_logits(...).argmax(-1)`, NaN as -inf."""
++        if self._hot_ids is not None and base_logits.shape[-1] == self._hot_ids.shape[0]:
++            logits = add_softcap(base_logits, bias, self.config.final_logit_softcapping)
++            return self._hot_ids[greedy_argmax(logits)]
+         return greedy_argmax(self.markov_logits(base_logits, bias))
+ 
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+diff --git a/models/inkling2/nvidia/model.py b/models/inkling2/nvidia/model.py
+index 4d3b63c..b02a039 100644
+--- a/models/inkling2/nvidia/model.py
++++ b/models/inkling2/nvidia/model.py
+@@ -72,6 +72,7 @@ from .ops.allreduce import Inkling2AllReduceWorkspace
+ from .ops.attention import compute_log_scaling_tau
+ from .ops.attn_res import attn_res
+ from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
++from .ops import thor_bf16x
+ from .ops.norm import rms_norm
+ from .ops.seq_parallel import SeqParallel
+ from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
+@@ -87,6 +88,20 @@ class Inkling2LogitsProcessor(LogitsProcessor):
+             UnquantizedEmbeddingMethod,
+         )
+ 
++        thor_wide = getattr(lm_head, "_thor_head_wide", None)
++        if (
++            thor_wide is not None
++            and self.head_dtype == torch.float32
++            and embedding_bias is None
++            and hidden_states.is_cuda
++            and hidden_states.dtype == torch.bfloat16
++            and 0 < hidden_states.numel() // hidden_states.shape[-1] <= 256
++            and isinstance(
++                lm_head.quant_method,
++                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
++            )
++        ):
++            return thor_bf16x.wide_linear(hidden_states, thor_wide, torch.float32, tag="head_wide")
+         if (
+             self.head_dtype == torch.float32
+             and isinstance(
+@@ -749,6 +764,18 @@ class Inkling2ForConditionalGeneration(
+             inputs_embeds = self.model.embed_input_ids(input_ids)
+         return self.model(positions, inputs_embeds)
+ 
++    def process_weights_after_loading(self) -> None:
++        if (
++            thor_bf16x.head_enabled()
++            and get_tensor_model_parallel_world_size() == 1
++            and self.lm_head.weight.is_cuda
++            and self.lm_head.weight.dtype == torch.bfloat16
++        ):
++            _, wide_entry = thor_bf16x.pack_weight(
++                self.lm_head.weight, "lm_head", "head", verify=True
++            )
++            self.lm_head._thor_head_wide = wide_entry
++
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+diff --git a/models/inkling2/nvidia/ops/attention.py b/models/inkling2/nvidia/ops/attention.py
+index a9eb023..01f9baf 100644
+--- a/models/inkling2/nvidia/ops/attention.py
++++ b/models/inkling2/nvidia/ops/attention.py
+@@ -162,8 +162,12 @@ class Inkling2FA4RelAttentionKernel(
+             {_num_warps_bucket(n) for n in range(1, max_num_reqs + 1)}
+         )
+         keys = []
+-        for is_local in (False, True):
+-            max_seqlen_q = 1
++        import os
++        fa4_mode = os.environ.get("INKLING2_THOR_FA4_PREFILL", "0").lower()
++        local_modes = (False,) if fa4_mode == "global" else (False, True)
++        min_q = 32 if fa4_mode == "global" else 1
++        for is_local in local_modes:
++            max_seqlen_q = min_q
+             while max_seqlen_q <= bucket_max_seqlen_q(max_tokens):
+                 variants: list[tuple[bool, int | None]] = [(False, None)]
+                 if not is_local:
+@@ -400,7 +404,9 @@ def plan_decode_attention(
+         if work <= (16 if max_query_len <= 2 else 8):
+             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
+         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
+-    return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
++    import os
++    div = 4 if (num_sms <= 32 and os.environ.get("INKLING2_THOR_SPLITCAP", "0") == "1") else 8
++    return max(num_sms // work, min(num_sms // div, 6 * num_sms // work))
+ 
+ 
+ _EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
+diff --git a/models/inkling2/nvidia/ops/conv_mix.py b/models/inkling2/nvidia/ops/conv_mix.py
+index e4c1e01..94b128f 100644
+--- a/models/inkling2/nvidia/ops/conv_mix.py
++++ b/models/inkling2/nvidia/ops/conv_mix.py
+@@ -89,7 +89,8 @@ def conv_mix(
+     )
+     if sp is None:
+         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
+-        if current_platform.is_device_capability_family(120):
++        if (current_platform.is_device_capability_family(110)
++                or current_platform.is_device_capability_family(120)):
+             # Native conv/mix kernels require Hopper or SM10x. Keep the
+             # loop executor's cache writes and residual rounding on SM12x.
+             short_conv(
+diff --git a/models/inkling2/nvidia/ops/gemv_q8.py b/models/inkling2/nvidia/ops/gemv_q8.py
+new file mode 100644
+index 0000000..3eacedd
+--- /dev/null
++++ b/models/inkling2/nvidia/ops/gemv_q8.py
+@@ -0,0 +1,159 @@
++# SPDX-License-Identifier: Apache-2.0
++# New file for the inkling-2-mini-gb10 recipe (2026-11-21), built on vLLM's Triton utilities.
++# Modified for Thor: import Triton directly to permit standalone validation.
++"""Weight-only 8-bit (int8 or fp8-e4m3, per-output-row fp32 scale) low-M
++projections for SM12x drafts: bf16 `x` [M, K] @ dequant(w) [N, K].T.
++
++The 8-bit values convert exactly to bf16, so each tile runs the same bf16
++tensor-core dot as the bf16 GEMV with half the weight bytes; the row scale
++(and optional bias) is applied once to the fp32 accumulator.
++"""
++
++import os
++
++import torch
++
++import triton
++import triton.language as tl
++
++MAX_M = 64
++
++
++def draft_quant_mode() -> str | None:
++    """INKLING2_DRAFT_QUANT: int8 | fp8 | off (default off)."""
++    mode = os.environ.get("INKLING2_DRAFT_QUANT", "off").lower()
++    if mode in ("", "0", "off", "none", "bf16"):
++        return None
++    if mode not in ("int8", "fp8"):
++        raise ValueError(f"INKLING2_DRAFT_QUANT={mode!r}: expected int8, fp8 or off")
++    return mode
++
++
++@torch.no_grad()
++def quantize_rows(
++    weight: torch.Tensor,
++    mode: str,
++    out: tuple[torch.Tensor, torch.Tensor] | None = None,
++    chunk: int = 8192,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-row symmetric quantization of bf16 `weight` [N, K]; refills `out`
++    in place when given (CUDA graphs keep pointing at it)."""
++    n, k = weight.shape
++    if out is None:
++        dtype = torch.int8 if mode == "int8" else torch.float8_e4m3fn
++        out = (
++            torch.empty((n, k), dtype=dtype, device=weight.device),
++            torch.empty((n,), dtype=torch.float32, device=weight.device),
++        )
++    q, scale = out
++    qmax = 127.0 if mode == "int8" else 448.0
++    for start in range(0, n, chunk):
++        rows = weight[start : start + chunk].float()
++        s = rows.abs().amax(1).clamp_min(1e-30) / qmax
++        v = rows / s[:, None]
++        if mode == "int8":
++            v = v.round_().clamp_(-127, 127)
++        else:
++            v = v.clamp_(-448.0, 448.0)
++        q[start : start + chunk].copy_(v.to(q.dtype))
++        scale[start : start + chunk].copy_(s)
++    return q, scale
++
++
++@triton.jit
++def _gemv_q8_kernel(
++    X,
++    W,
++    S,
++    B,
++    Y,
++    M,
++    N,
++    K,
++    SX,
++    SW,
++    SY,
++    HAS_BIAS: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MP: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    cols = pid * BN + tl.arange(0, BN)
++    rows = tl.program_id(1) * MP + tl.arange(0, MP)
++    acc = tl.zeros((MP, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        w = tl.load(
++            W + cols[None, :].to(tl.int64) * SW + ks[:, None],
++            (cols[None, :] < N) & (ks[:, None] < K),
++            other=0.0,
++        )
++        x = tl.load(
++            X + rows[:, None] * SX + ks[None, :],
++            (rows[:, None] < M) & (ks[None, :] < K),
++            other=0,
++        )
++        acc += tl.dot(x, w.to(tl.bfloat16))
++    acc = acc * tl.load(S + cols, cols < N, other=0)[None, :]
++    if HAS_BIAS:
++        acc += tl.load(B + cols, cols < N, other=0).to(tl.float32)[None, :]
++    tl.store(
++        Y + rows[:, None] * SY + cols[None, :],
++        acc.to(Y.dtype.element_ty),
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++def _config(n: int, k: int) -> tuple[int, int, int, int]:
++    if k <= 256:
++        return 64, 256, 4, 3
++    if n >= 16384:
++        return 32, 512, 4, 3
++    if os.environ.get("INKLING2_DRAFT_W8TILE", "0") == "1" and n <= 4096:
++        return 16, 256, 4, 4
++    return 32, 256, 4, 4
++
++
++def gemv_q8(
++    x: torch.Tensor,
++    q: torch.Tensor,
++    scale: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    out_dtype: torch.dtype | None = None,
++) -> torch.Tensor:
++    """`(x @ (q * scale[:, None]).T + bias)` in `out_dtype` (default x's)."""
++    lead = x.shape[:-1]
++    x2 = x.reshape(-1, x.shape[-1])
++    if x2.stride(-1) != 1:
++        x2 = x2.contiguous()
++    m, k = x2.shape
++    n = q.shape[0]
++    assert q.shape[1] == k and q.stride(-1) == 1
++    out = torch.empty((m, n), device=x.device, dtype=out_dtype or x.dtype)
++    if m:
++        bn, bk, warps, stages = _config(n, k)
++        mp = 16 if m <= 16 else 32 if m <= 32 else 64
++        if mp > 16:
++            bn, bk, warps, stages = 32, min(bk, 256), 4, 2
++        _gemv_q8_kernel[(triton.cdiv(n, bn), triton.cdiv(m, mp))](
++            x2,
++            q,
++            scale,
++            bias,
++            out,
++            m,
++            n,
++            k,
++            x2.stride(0),
++            q.stride(0),
++            out.stride(0),
++            HAS_BIAS=bias is not None,
++            BN=bn,
++            BK=bk,
++            MP=mp,
++            num_warps=warps,
++            num_stages=stages,
++        )
++    return out.view(*lead, n)
++
+diff --git a/models/inkling2/nvidia/ops/moe_sm90.py b/models/inkling2/nvidia/ops/moe_sm90.py
+index 53417df..087faf8 100644
+--- a/models/inkling2/nvidia/ops/moe_sm90.py
++++ b/models/inkling2/nvidia/ops/moe_sm90.py
+@@ -14,9 +14,7 @@ from typing import TYPE_CHECKING
+ import torch
+ 
+ import vllm.envs as envs
+-from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+-    moe_align_block_size,
+-)
++from .thor_alignment import moe_align_block_size
+ from vllm.triton_utils import tl, triton
+ 
+ from .activation import _situ
+diff --git a/models/inkling2/nvidia/ops/thor_alignment.py b/models/inkling2/nvidia/ops/thor_alignment.py
+new file mode 100644
+index 0000000..1be7f8e
+--- /dev/null
++++ b/models/inkling2/nvidia/ops/thor_alignment.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Stable Humming route alignment without native CUDA extensions or CPU reads."""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _count_routes(Ids, Ranks, Counts, Rows, Experts,
++                  N: tl.constexpr, E: tl.constexpr, BLOCK: tl.constexpr,
++                  CAPACITY: tl.constexpr, CHUNK: tl.constexpr,
++                  CHUNKS: tl.constexpr, INIT: tl.constexpr):
++    expert = tl.program_id(0)
++    chunk = tl.program_id(1)
++    row = chunk * CHUNK + tl.arange(0, CHUNK)
++    ids = tl.load(Ids + row, row < N, other=-1)
++    matches = (row < N) & (ids == expert)
++    ranks = tl.cumsum(matches.to(tl.int32)) - 1
++    tl.store(Ranks + row, ranks, matches)
++    tl.store(Counts + chunk * E + expert, tl.sum(matches.to(tl.int32)))
++    # Disjoint initialization; the next launch scatters real routes over it.
++    init = (chunk * E + expert) * INIT + tl.arange(0, INIT)
++    tl.store(Rows + init, N, init < CAPACITY)
++    tl.store(Experts + init, -1, init < tl.cdiv(CAPACITY, BLOCK))
++
++
++@triton.jit
++def _finish_decode(Ids, Ranks, Counts, Rows, Experts, Total,
++                   N: tl.constexpr, E: tl.constexpr, BLOCK: tl.constexpr,
++                   EP: tl.constexpr, RP: tl.constexpr):
++    expert = tl.arange(0, EP)
++    counts = tl.load(Counts + expert, expert < E, other=0)
++    padded = tl.cdiv(counts, BLOCK) * BLOCK
++    starts = tl.cumsum(padded) - padded
++    tl.store(Total, tl.sum(padded))
++    row = tl.arange(0, RP)
++    ids = tl.load(Ids + row, row < N, other=-1)
++    valid = (row < N) & (ids >= 0) & (ids < E)
++    rank = tl.load(Ranks + row, valid, other=0)
++    start = tl.gather(starts, tl.minimum(tl.maximum(ids, 0), E - 1).to(tl.int32), axis=0)
++    dest = start + rank
++    tl.store(Rows + dest, row, valid)
++    tl.store(Experts + dest // BLOCK, ids, valid & (rank % BLOCK == 0))
++
++
++@triton.jit
++def _prefix_chunks(Counts, Offsets, Total,
++                   E: tl.constexpr, CHUNKS: tl.constexpr,
++                   EP: tl.constexpr, CP: tl.constexpr, BLOCK: tl.constexpr):
++    expert = tl.arange(0, EP)
++    chunk = tl.arange(0, CP)
++    counts = tl.load(Counts + chunk[:, None] * E + expert[None, :],
++                     (chunk[:, None] < CHUNKS) & (expert[None, :] < E), other=0)
++    cumulative = tl.cumsum(counts, axis=0)
++    totals = tl.sum(counts, axis=0)
++    padded = tl.cdiv(totals, BLOCK) * BLOCK
++    starts = tl.cumsum(padded) - padded
++    offsets = starts[None, :] + cumulative - counts
++    tl.store(Offsets + chunk[:, None] * E + expert[None, :], offsets,
++             (chunk[:, None] < CHUNKS) & (expert[None, :] < E))
++    tl.store(Total, tl.sum(padded))
++
++
++@triton.jit
++def _scatter_routes(Ids, Ranks, Offsets, Rows, Experts,
++                    N: tl.constexpr, E: tl.constexpr,
++                    BLOCK: tl.constexpr, CHUNK: tl.constexpr):
++    chunk = tl.program_id(0)
++    row = chunk * CHUNK + tl.arange(0, CHUNK)
++    ids = tl.load(Ids + row, row < N, other=-1)
++    valid = (row < N) & (ids >= 0) & (ids < E)
++    rank = tl.load(Ranks + row, valid, other=0)
++    start = tl.load(Offsets + chunk * E + ids, valid, other=0)
++    dest = start + rank
++    tl.store(Rows + dest, row, valid)
++    # Chunk offsets include previous chunks, so a block may start mid-chunk.
++    tl.store(Experts + dest // BLOCK, ids, valid & (dest % BLOCK == 0))
++
++
++def moe_align_block_size(topk_ids, block_size, num_experts,
++                         ignore_invalid_experts=False):
++    """Match the portable Thor implementation, including padding and row order."""
++    if not ignore_invalid_experts or block_size <= 0 or num_experts <= 0:
++        raise ValueError("Thor alignment requires positive sizes and ignore_invalid_experts=True")
++    if not topk_ids.is_cuda:
++        raise ValueError("Triton alignment requires CUDA route indices")
++    flat = topk_ids.reshape(-1)
++    count = flat.numel()
++    capacity = count + num_experts * (block_size - 1)
++    if count < num_experts:
++        capacity = min(count * block_size, capacity)
++    rows = torch.empty(capacity, dtype=torch.int32, device=flat.device)
++    experts = torch.empty(triton.cdiv(capacity, block_size), dtype=torch.int32, device=flat.device)
++    if not count:
++        return rows, experts, torch.zeros(1, dtype=torch.int32, device=flat.device)
++    total = torch.empty(1, dtype=torch.int32, device=flat.device)
++    chunk_size = 256
++    chunks = triton.cdiv(count, chunk_size)
++    ranks = torch.empty(count, dtype=torch.int32, device=flat.device)
++    counts = torch.empty((chunks, num_experts), dtype=torch.int32, device=flat.device)
++    with torch.cuda.device(flat.device):
++        _count_routes[(num_experts, chunks)](
++            flat, ranks, counts, rows, experts, count, num_experts, block_size,
++            capacity, chunk_size, chunks,
++            triton.next_power_of_2(triton.cdiv(capacity, num_experts * chunks)),
++        )
++        if chunks == 1:
++            _finish_decode[(1,)](
++                flat, ranks, counts, rows, experts, total,
++                count, num_experts, block_size,
++                triton.next_power_of_2(num_experts), triton.next_power_of_2(count),
++            )
++        else:
++            offsets = torch.empty_like(counts)
++            _prefix_chunks[(1,)](
++                counts, offsets, total, num_experts, chunks,
++                triton.next_power_of_2(num_experts), triton.next_power_of_2(chunks),
++                block_size, num_warps=8,
++            )
++            _scatter_routes[(chunks,)](
++                flat, ranks, offsets, rows, experts, count, num_experts,
++                block_size, chunk_size,
++            )
++    return rows, experts, total
+diff --git a/models/inkling2/nvidia/ops/thor_bf16x.py b/models/inkling2/nvidia/ops/thor_bf16x.py
+new file mode 100644
+index 0000000..3d3d3f6
+--- /dev/null
++++ b/models/inkling2/nvidia/ops/thor_bf16x.py
+@@ -0,0 +1,211 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Jetson AGX Thor (sm_110) exact 12-bit packed BF16 (bf16x) GEMV/GEMM dispatch.
++
++Wraps Andy Shu's MIT-licensed pico `bf16x` exact 12-bit format (`inkling_pico12`)
++and cqingwang's MIT-licensed `inkling_wide` multi-row GEMM, compiled for sm_110a.
++Every packed weight decodes bit-identically to the original BF16 tensor (verified
++at load time). Prefill batches above the row thresholds stay on stock cuBLAS.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++from pathlib import Path
++
++import torch
++
++_STATE: dict[str, object] = {
++    "ready": False,
++    "pico_ops": None,
++    "wide_ops": None,
++    "pico_ext": None,
++    "wide_ext": None,
++    "ws_ready": False,
++    "verified_once": False,
++    "packed_count": 0,
++    "packed_bytes": 0,
++    "seen_paths": set(),
++}
++
++
++def enabled() -> bool:
++    return os.environ.get("INKLING2_THOR_BF16X", "0") == "1"
++
++
++def dense_enabled() -> bool:
++    return enabled() and os.environ.get("INKLING2_THOR_BF16X_DENSE", "0") == "1"
++
++
++def head_enabled() -> bool:
++    return enabled() and os.environ.get("INKLING2_THOR_BF16X_HEAD", "1") != "0"
++
++
++def _note(tag: str) -> None:
++    seen = _STATE["seen_paths"]
++    if tag not in seen:
++        seen.add(tag)
++        print(f"[thor_bf16x] ACTIVE PATH: {tag}", file=sys.stderr, flush=True)
++
++
++def _load_so(mod_name: str, so_path: Path):
++    spec = importlib.util.spec_from_file_location(mod_name, str(so_path))
++    if spec is None or spec.loader is None:
++        raise RuntimeError(f"thor_bf16x: cannot load extension {so_path}")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _ensure_init(device: torch.device) -> tuple[object, object]:
++    if not _STATE["ready"]:
++        overlay_root = os.environ.get("INKLING2_THOR_BF16X_SRC", "/opt/thor-opt")
++        if overlay_root not in sys.path:
++            sys.path.insert(0, overlay_root)
++        import inkling_pico12.ops as po
++        import inkling_wide.ops as wo
++
++        prebuilt_dir = Path(
++            os.environ.get("INKLING2_THOR_BF16X_PREBUILT", "/opt/thor-opt/ext")
++        )
++        pico_so = prebuilt_dir / "inkling_pico12_ext.so"
++        wide_so = prebuilt_dir / "inkling_wide_ext.so"
++        arch = os.environ.get("INKLING2_THOR_BF16X_ARCH", "110a")
++        if pico_so.is_file() and wide_so.is_file():
++            pext = _load_so("inkling_pico12_ext", pico_so)
++            wext = _load_so("inkling_wide_ext", wide_so)
++            src_label = f"prebuilt({prebuilt_dir})"
++        else:
++            import inkling_pico12.build as pb
++            import inkling_wide.build as wb
++
++            cache_base = Path(
++                os.environ.get(
++                    "INKLING2_THOR_BF16X_CACHE",
++                    os.path.join(os.path.expanduser("~"), "thor-bf16x-cache"),
++                )
++            )
++            pext = pb.load(cache_dir=str(cache_base / "pico12"), arch=arch, verbose=False)
++            wext = wb.load(cache_dir=str(cache_base / "wide"), arch=arch, verbose=False)
++            src_label = f"jit({cache_base})"
++
++        po.EXT = pext
++        wo.EXT = wext
++        wo.SET.sms = torch.cuda.get_device_properties(device).multi_processor_count
++        wo.SET.min_m = 1
++        wo.SET.scope = "all"
++        wo.IN_SCOPE[0] = True
++        _STATE["pico_ops"] = po
++        _STATE["wide_ops"] = wo
++        _STATE["pico_ext"] = pext
++        _STATE["wide_ext"] = wext
++        _STATE["ready"] = True
++        print(
++            f"[thor_bf16x] Loaded sm_{arch} extensions via {src_label} (sms={wo.SET.sms})",
++            file=sys.stderr,
++            flush=True,
++        )
++
++    if not _STATE["ws_ready"]:
++        wo = _STATE["wide_ops"]
++        wo.WS["ws"] = torch.empty(4 * 1024 * 1024, dtype=torch.float32, device=device)
++        wo.WS["cnt"] = torch.zeros(2048, dtype=torch.int32, device=device)
++        _STATE["ws_ready"] = True
++
++    return _STATE["pico_ops"], _STATE["wide_ops"]
++
++
++def pack_weight(
++    weight: torch.Tensor,
++    label: str,
++    kind: str,
++    *,
++    verify: bool = False,
++) -> tuple[object, object]:
++    """Encode a contiguous 2D CUDA BF16 weight into (pico Pack, wide Wide)."""
++    w = weight.detach().contiguous()
++    if w.data_ptr() % 16 != 0:
++        w = w.clone()
++    po, wo = _ensure_init(w.device)
++    pack = po.encode(w, label)
++    if verify or not _STATE["verified_once"]:
++        wext = _STATE["wide_ext"]
++        decoded = wext.decode(pack.buf, pack.n, pack.k)
++        mismatches = int(
++            (decoded.view(torch.uint16) != w.view(torch.uint16)).sum().item()
++        )
++        if mismatches != 0:
++            raise RuntimeError(
++                f"thor_bf16x: exact decode verification FAILED on {label}: {mismatches} mismatches"
++            )
++        _STATE["verified_once"] = True
++        ratio = pack.buf.numel() * pack.buf.element_size() / (
++            w.numel() * w.element_size()
++        )
++        print(
++            f"[thor_bf16x] VERIFIED BIT-EXACT {label} shape={tuple(w.shape)} "
++            f"ratio={ratio:.3f} mt={pack.mt}",
++            file=sys.stderr,
++            flush=True,
++        )
++    wide_entry = wo.make(w, label, kind, pack)
++    _STATE["packed_count"] += 1
++    _STATE["packed_bytes"] += pack.buf.numel() * pack.buf.element_size()
++    if kind == "head" or _STATE["packed_count"] in (1, 48, 49):
++        print(
++            f"[thor_bf16x] packed #{_STATE['packed_count']} {label} kind={kind} "
++            f"fmt={wide_entry.fmt} total={_STATE['packed_bytes']/1e6:.1f} MB",
++            file=sys.stderr,
++            flush=True,
++        )
++    return pack, wide_entry
++
++
++def pico_linear(
++    x: torch.Tensor,
++    pack: object,
++    out_dtype: torch.dtype,
++    out: torch.Tensor | None = None,
++    tag: str = "pico",
++) -> torch.Tensor:
++    _note(tag)
++    po = _STATE["pico_ops"]
++    if out is not None:
++        m = x.numel() // x.shape[-1]
++        if not po.out_ok(out, m, pack, out_dtype, x.device):
++            res = po.linear(x, pack, out_dtype)
++            out.copy_(res)
++            return out
++    return po.linear(x, pack, out_dtype, out=out)
++
++
++def wide_linear(
++    x: torch.Tensor,
++    entry: object,
++    out_dtype: torch.dtype,
++    out: torch.Tensor | None = None,
++    tag: str = "wide",
++) -> torch.Tensor:
++    _note(tag)
++    wo = _STATE["wide_ops"]
++    if out is not None:
++        m = x.numel() // x.shape[-1]
++        if not wo.out_ok(out, m, entry, out_dtype, x.device):
++            res = wo.linear(x, entry, out_dtype)
++            out.copy_(res)
++            return out
++    return wo.linear(x, entry, out_dtype, out=out)
++
++
++def wide_stacked(
++    x_q: torch.Tensor,
++    x_k: torch.Tensor,
++    x_v: torch.Tensor,
++    entry: object,
++    regions: tuple[int, int, int],
++    tag: str = "wide_stacked",
++) -> torch.Tensor:
++    _note(tag)
++    wo = _STATE["wide_ops"]
++    return wo.stacked_project(x_q, x_k, x_v, entry, regions)
+diff --git a/models/inkling2/nvidia/ops/thor_vcap.py b/models/inkling2/nvidia/ops/thor_vcap.py
+new file mode 100644
+index 0000000..205021c
+--- /dev/null
++++ b/models/inkling2/nvidia/ops/thor_vcap.py
+@@ -0,0 +1,258 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Exact dynamic verify-width cap (vcap) for Inkling-2-Mini DSpark on Jetson Thor.
++
++Uses DSpark's own per-step max draft probability m_j = max(softmax(z_j / T))
++to compute a stopping rule surv_j = prod_{i<=j} m_i inside the captured FULL
++DSpark CUDA graph (zero host sync, static [bs, 8] graphs preserved).
++
++Dead verify rows (local_pos >= L) are:
++  1. Marked in `forward_context.is_padding`, so `Inkling2MoE` / `HummingExperts`
++     (`ignore_invalid_experts=True`) completely skips their MoE experts.
++  2. Masked to `-1` in `gather_draft_sampled`, so `RejectionSampler` stops at
++     live row <= L-1 and draws the exact bonus token from live row L-1 (exact
++     greedy chain and exact sampled distribution).
++
++Env:
++  INKLING2_THOR_VCAP=off | fixed:<L> | conf:<T>[,min=<A>,max=<B>]
++                     | cost:<B1>=<T1>,<B2>=<T2>,...[,min=<A>,max=<B>]
++"""
++
++from __future__ import annotations
++
++import os
++
++try:
++    import torch
++    from vllm.triton_utils import tl, triton
++except ImportError:  # allow offline unit tests of spec parsing without torch/vllm
++    torch = None  # type: ignore[assignment]
++    tl = None  # type: ignore[assignment]
++    triton = None  # type: ignore[assignment]
++
++
++def parse_spec(raw: str | None = None) -> dict[str, object] | None:
++    if raw is None:
++        raw = os.environ.get("INKLING2_THOR_VCAP", "").strip()
++    if not raw or raw.lower() in ("0", "off", "false", "none"):
++        return None
++    parts = [p.strip() for p in raw.split(",") if p.strip()]
++    head = parts[0]
++    min_l, max_l = 2, 8
++    kv_parts = parts[1:]
++    if head.startswith("fixed:"):
++        L = int(head.split(":", 1)[1])
++        if not 1 <= L <= 8:
++            raise ValueError(f"thor_vcap: fixed L={L} must be in 1..8")
++        return {"mode": "fixed", "fixed_l": L, "min_l": L, "max_l": L}
++    if head.startswith("conf:"):
++        t = float(head.split(":", 1)[1])
++        table = [(1024, t)]
++    elif head.startswith("cost:"):
++        first_kv = head.split(":", 1)[1]
++        table = []
++        rem = []
++        for item in [first_kv, *kv_parts]:
++            k, v = item.split("=", 1)
++            k = k.strip()
++            if k == "min":
++                min_l = int(v)
++            elif k == "max":
++                max_l = int(v)
++            else:
++                table.append((int(k), float(v)))
++        kv_parts = rem
++        table.sort(key=lambda x: x[0])
++    else:
++        raise ValueError(f"thor_vcap: invalid INKLING2_THOR_VCAP={raw!r}")
++    for item in kv_parts:
++        k, v = item.split("=", 1)
++        k = k.strip()
++        if k == "min":
++            min_l = int(v)
++        elif k == "max":
++            max_l = int(v)
++    if not (1 <= min_l <= max_l <= 8):
++        raise ValueError(f"thor_vcap: bad min/max ({min_l}, {max_l})")
++    return {"mode": "conf", "table": table, "min_l": min_l, "max_l": max_l}
++
++
++def threshold_for_bs(cfg: dict[str, object], bs: int) -> float:
++    if cfg["mode"] == "fixed":
++        return 0.0
++    table = cfg["table"]
++    for b, t in table:
++        if bs <= b:
++            return t
++    return table[-1][1]
++
++
++if triton is not None:
++
++    @triton.jit
++    def _vcap_step_kernel(
++        Logits,
++        logits_stride,
++        IdxMap,
++        Temp,
++        Surv,
++        LiveLen,
++        thresh,
++        step_idx,
++        V,
++        BLOCK: tl.constexpr,
++    ):
++        """Update surv[r] *= max(softmax(logits[r] / T)) and advance live_len[r]."""
++        r = tl.program_id(0)
++        req_state_idx = tl.load(IdxMap + r).to(tl.int64)
++        temp = tl.load(Temp + req_state_idx).to(tl.float32)
++        inv_t = tl.where(temp > 0.0, 1.0 / temp, 1.0)
++
++        row_ptr = Logits + r.to(tl.int64) * logits_stride
++        m = tl.full((), float("-inf"), tl.float32)
++        s = tl.full((), 0.0, tl.float32)
++        for off in range(0, V, BLOCK):
++            cols = off + tl.arange(0, BLOCK)
++            mask = cols < V
++            vals = tl.load(row_ptr + cols, mask=mask, other=float("-inf")).to(
++                tl.float32
++            )
++            z = vals * inv_t
++            bm = tl.max(z, axis=0)
++            new_m = tl.maximum(m, bm)
++            scale_old = tl.where(m > float("-inf"), tl.exp(m - new_m), 0.0)
++            bs = tl.where(
++                new_m > float("-inf"),
++                tl.sum(
++                    tl.where(mask & (z > float("-inf")), tl.exp(z - new_m), 0.0),
++                    axis=0,
++                ),
++                0.0,
++            )
++            s = s * scale_old + bs
++            m = new_m
++
++        max_prob = tl.where(s > 0.0, 1.0 / s, 0.0)
++        prev_surv = tl.load(Surv + r)
++        new_surv = prev_surv * max_prob
++        tl.store(Surv + r, new_surv)
++        cur_l = tl.load(LiveLen + r)
++        next_l = tl.where(
++            (cur_l == step_idx + 1) & (new_surv >= thresh), step_idx + 2, cur_l
++        )
++        tl.store(LiveLen + r, next_l)
++
++    @triton.jit
++    def _vcap_commit_kernel(
++        LiveLen,
++        IdxMap,
++        OutLiveLens,
++        num_reqs,
++        min_l,
++        max_l,
++        FIXED_L: tl.constexpr,
++    ):
++        r = tl.program_id(0)
++        if r >= num_reqs:
++            return
++        req_state_idx = tl.load(IdxMap + r).to(tl.int64)
++        if FIXED_L > 0:
++            val = FIXED_L
++        else:
++            val = tl.load(LiveLen + r)
++            val = tl.maximum(min_l, tl.minimum(max_l, val))
++        tl.store(OutLiveLens + req_state_idx, val)
++
++    @triton.jit
++    def _vcap_mark_padding_kernel(
++        IsPadding,
++        LogitsIndices,
++        ExpandedIdxMap,
++        ExpandedLocalPos,
++        Positions,
++        PrefillLen,
++        LiveLens,
++        num_logits,
++        BLOCK: tl.constexpr,
++    ):
++        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++        mask = offs < num_logits
++        lp = tl.load(ExpandedLocalPos + offs, mask=mask, other=0)
++        req_idx = tl.load(ExpandedIdxMap + offs, mask=mask, other=0).to(tl.int64)
++        tok_idx = tl.load(LogitsIndices + offs, mask=mask, other=0).to(tl.int64)
++        pos = tl.load(Positions + tok_idx, mask=mask, other=0)
++        plen = tl.load(PrefillLen + req_idx, mask=mask, other=0)
++        live_l = tl.load(LiveLens + req_idx, mask=mask, other=8)
++        is_dead = mask & (lp > 0) & ((pos - lp) >= plen) & (lp >= live_l)
++        tl.store(IsPadding + tok_idx, True, mask=is_dead)
++
++
++def update_step(
++    logits: "torch.Tensor",
++    idx_map_step: "torch.Tensor",
++    temperature: "torch.Tensor",
++    surv: "torch.Tensor",
++    live_len: "torch.Tensor",
++    thresh: float,
++    step_idx: int,
++) -> None:
++    num_reqs, vocab = logits.shape
++    _vcap_step_kernel[(num_reqs,)](
++        logits,
++        logits.stride(0),
++        idx_map_step,
++        temperature,
++        surv,
++        live_len,
++        thresh,
++        step_idx,
++        vocab,
++        BLOCK=2048,
++        num_warps=8,
++    )
++
++
++def commit_live_lens(
++    live_len: "torch.Tensor",
++    idx_map_0: "torch.Tensor",
++    out_live_lens: "torch.Tensor",
++    cfg: dict[str, object],
++) -> None:
++    num_reqs = idx_map_0.shape[0]
++    fixed_l = int(cfg["fixed_l"]) if cfg["mode"] == "fixed" else 0
++    _vcap_commit_kernel[(num_reqs,)](
++        live_len,
++        idx_map_0,
++        out_live_lens,
++        num_reqs,
++        int(cfg["min_l"]),
++        int(cfg["max_l"]),
++        FIXED_L=fixed_l,
++        num_warps=1,
++    )
++
++
++def mark_dead_padding(
++    is_padding: "torch.Tensor",
++    logits_indices: "torch.Tensor",
++    expanded_idx_mapping: "torch.Tensor",
++    expanded_local_pos: "torch.Tensor",
++    positions: "torch.Tensor",
++    prefill_len: "torch.Tensor",
++    live_lens: "torch.Tensor",
++) -> None:
++    n = logits_indices.shape[0]
++    if n <= 0:
++        return
++    BLOCK = 256
++    _vcap_mark_padding_kernel[(triton.cdiv(n, BLOCK),)](
++        is_padding,
++        logits_indices,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        positions,
++        prefill_len,
++        live_lens,
++        n,
++        BLOCK=BLOCK,
++        num_warps=4,
++    )
+diff --git a/models/inkling2/nvidia/vision.py b/models/inkling2/nvidia/vision.py
+index 5ac31a3..7fa9741 100644
+--- a/models/inkling2/nvidia/vision.py
++++ b/models/inkling2/nvidia/vision.py
+@@ -91,7 +91,7 @@ class Inkling2VisionAttention(nn.Module):
+         else:
+             from vllm.vllm_flash_attn import flash_attn_varlen_func
+ 
+-            version = 2 if current_platform.is_device_capability_family(120) else 3
++            version = 3 if current_platform.is_device_capability_family(90) else 2
+             out = flash_attn_varlen_func(q, k, v, fa_version=version, **kwargs)
+         return self.out_proj(out.view(hidden.shape))
+ 
+diff --git a/models/inkling2/speculator.py b/models/inkling2/speculator.py
+index 6beae2b..db79b2f 100644
+--- a/models/inkling2/speculator.py
++++ b/models/inkling2/speculator.py
+@@ -8,7 +8,9 @@ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
+ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++import sys
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
++from vllm.models.inkling2.nvidia.ops import thor_vcap
+ 
+ 
+ class Inkling2DSparkSpeculator(DSparkSpeculator):
+@@ -34,6 +36,26 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         self.f_rnn = torch.zeros(
+             self.max_num_reqs, config.hidden_size, dtype=self.dtype, device=device
+         )
++        self._vcap_cfg = thor_vcap.parse_spec()
++        self._vcap_live_lens: torch.Tensor | None = None
++        if self._vcap_cfg is not None:
++            self._vcap_live_lens = torch.full(
++                (self.max_num_reqs,),
++                self.num_speculative_steps + 1,
++                dtype=torch.int32,
++                device=device,
++            )
++            self._vcap_tmp_surv = torch.ones(
++                self.max_num_reqs, dtype=torch.float32, device=device
++            )
++            self._vcap_tmp_live = torch.ones(
++                self.max_num_reqs, dtype=torch.int32, device=device
++            )
++            print(
++                f"[thor_vcap] ENABLED cfg={self._vcap_cfg}",
++                file=sys.stderr,
++                flush=True,
++            )
+ 
+     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+         # Draft base logits come from a bf16 GEMM, unlike the target's fp32 head.
+@@ -67,11 +89,45 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         state = hidden.new_zeros(num_reqs, self.model.config.markov_rank)
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++        vcap_cfg = self._vcap_cfg
++        vcap_thresh = (
++            thor_vcap.threshold_for_bs(vcap_cfg, num_reqs)
++            if vcap_cfg is not None
++            else 0.0
++        )
++        use_conf_vcap = (
++            vcap_cfg is not None
++            and vcap_cfg["mode"] == "conf"
++            and vcap_thresh > 0.0
++        )
++        if vcap_cfg is not None:
++            surv = self._vcap_tmp_surv[:num_reqs]
++            live = self._vcap_tmp_live[:num_reqs]
++            surv.fill_(1.0)
++            live.fill_(1 if use_conf_vcap else int(vcap_cfg["max_l"]))
+         for i in range(n_spec):
+             state, bias = self.model.markov_step(state, prev, context[i])
+             if self.draft_logits is None:
++                if use_conf_vcap:
++                    _, compact = self.model.markov_logits_and_compact(
++                        base_logits[:, i], bias
++                    )
++                    thor_vcap.update_step(
++                        compact, idx_map[:, i], self.temperature, surv, live, vcap_thresh, i
++                    )
+                 prev = self.model.markov_argmax(base_logits[:, i], bias)
+             else:
+-                logits = self.model.markov_logits(base_logits[:, i], bias)
++                logits, compact = self.model.markov_logits_and_compact(
++                    base_logits[:, i], bias
++                )
++                if use_conf_vcap:
++                    thor_vcap.update_step(
++                        compact, idx_map[:, i], self.temperature, surv, live, vcap_thresh, i
++                    )
+                 prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
+             self.draft_tokens[:num_reqs, i] = prev
++        if vcap_cfg is not None:
++            assert self._vcap_live_lens is not None
++            thor_vcap.commit_live_lens(
++                live, idx_map[:, 0], self._vcap_live_lens, vcap_cfg
++            )
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index 1f831da..bdf5365 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -1619,6 +1619,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             total_num_logits,
+             self.model_state.num_new_sampled_tokens_per_step,
+         )
++        vcap_live_lens = getattr(self.speculator, "_vcap_live_lens", None)
++        if vcap_live_lens is not None:
++            if self.rejection_sampler is not None:
++                self.rejection_sampler._vcap_live_lens = vcap_live_lens
++            if draft_tokens and envs.VLLM_MOE_SKIP_PADDING:
++                from vllm.models.inkling2.nvidia.ops import thor_vcap
++                thor_vcap.mark_dead_padding(
++                    is_padding,
++                    logits_indices,
++                    expanded_idx_mapping,
++                    expanded_local_pos,
++                    self.input_buffers.positions,
++                    self.req_states.prefill_len.gpu,
++                    vcap_live_lens,
++                )
+ 
+         fast_prefill = None
+         if self.fast_prefill is not None:
+diff --git a/v1/worker/gpu/spec_decode/rejection_sampler.py b/v1/worker/gpu/spec_decode/rejection_sampler.py
+index c1844c2..e3b16bc 100644
+--- a/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -97,8 +97,10 @@ def _gather_draft_sampled_kernel(
+     expanded_local_pos_ptr,
+     # [max_num_reqs]
+     prefill_len_ptr,
++    live_lens_ptr,
+     num_logits,
+     BLOCK_SIZE: tl.constexpr,
++    HAS_LIVE_LENS: tl.constexpr,
+ ):
+     block = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+     mask = block < num_logits
+@@ -112,6 +114,9 @@ def _gather_draft_sampled_kernel(
+     # slots in a step starting within the prefill are placeholders (e.g. the
+     # padded first step after a P/D remote KV load).
+     is_placeholder = (local_pos > 0) & (pos - local_pos < prefill_len)
++    if HAS_LIVE_LENS:
++        live_len = tl.load(live_lens_ptr + req_state_idx, mask=mask, other=8)
++        is_placeholder = is_placeholder | ((local_pos > 0) & (local_pos >= live_len))
+     token_id = tl.where(is_placeholder, -1, token_id)
+     tl.store(draft_sampled_ptr + block, token_id, mask=mask)
+     tl.store(pos_ptr + block, pos, mask=mask)
+@@ -124,6 +129,7 @@ def gather_draft_sampled(
+     expanded_idx_mapping: torch.Tensor,
+     expanded_local_pos: torch.Tensor,
+     prefill_len: torch.Tensor,
++    live_lens: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Gather the input token and position of each logits row.
+ 
+@@ -143,8 +149,10 @@ def gather_draft_sampled(
+         expanded_idx_mapping,
+         expanded_local_pos,
+         prefill_len,
++        live_lens if live_lens is not None else prefill_len,
+         num_logits,
+         BLOCK_SIZE=BLOCK_SIZE,
++        HAS_LIVE_LENS=live_lens is not None,
+     )
+     return draft_sampled, pos
+ 
+@@ -446,6 +454,7 @@ class RejectionSampler:
+             input_batch.expanded_idx_mapping,
+             input_batch.expanded_local_pos,
+             self.sampler.req_states.prefill_len.gpu,
++            getattr(self, "_vcap_live_lens", None),
+         )
+ 
+         logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)

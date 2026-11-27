@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 180" role="img" aria-labelledby="title desc">
+  <title id="title">Inkling 2 Mini on Jetson AGX Thor</title>
+  <desc id="desc">A dark graphite and gold title card by Matthew Rogers.</desc>
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0v24" fill="none" stroke="#222935" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect x="1" y="1" width="958" height="178" rx="14" fill="#10141b" stroke="#394152"/>
+  <path d="M727 2h217q14 0 14 14v148q0 14-14 14H662z" fill="url(#grid)"/>
+  <path d="M40 42v95" stroke="#f8c45e" stroke-width="4"/>
+  <g font-family="system-ui,sans-serif">
+    <text x="64" y="55" fill="#f8c45e" font-size="16" font-weight="700" letter-spacing="3">JETSON AGX THOR // SM110</text>
+    <text x="64" y="108" fill="#edf1f7" font-size="49" font-weight="800">INKLING 2 MINI</text>
+    <text x="65" y="138" fill="#b2bccb" font-size="17" letter-spacing="1">MATTHEW ROGERS  ·  @MATTHEWROGERS</text>
+  </g>
+  <g fill="none" stroke="#f8c45e" stroke-width="2">
+    <rect x="785" y="53" width="85" height="73" rx="8"/>
+    <path d="M799 43v10m14-10v10m14-10v10m14-10v10m14-10v10m-56 73v10m14-10v10m14-10v10m14-10v10m14-10v10m15-69h10m-10 16h10m-10 16h10m-10 16h10m-105-48h10m-10 16h10m-10 16h10m-10 16h10"/>
+    <path d="M826 67l-15 24h14l-2 20 18-27h-15l4-17z" fill="#f8c45e" stroke="none"/>
+  </g>
+</svg>
