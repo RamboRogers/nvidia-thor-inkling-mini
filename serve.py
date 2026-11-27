@@ -2,21 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launch or smoke-test the Jetson Thor v6 profile on loopback."""
 import argparse
+import base64
 import grp
 import json
 import os
 from pathlib import Path
 import platform
 import shlex
+import struct
 import subprocess
 import time
 import urllib.request
+import zlib
 
 from build import TAG, capture, run
 import fetch_model
 
 MODEL = 'inkling-mini'
 CONTEXT = 262144
+IMAGE_LIMIT = 16
 ENV = {
     'HOME': '/trial-cache',
     'HF_HUB_OFFLINE': '1',
@@ -73,7 +77,8 @@ def launch_args(args):
         '--max-num-batched-tokens', '2048', '--gpu-memory-utilization', '0.35',
         '--kv-cache-memory-bytes', str(28 * 2**30), '--kv-cache-dtype', 'bfloat16',
         '--reasoning-parser', 'inkling', '--enable-auto-tool-choice', '--tool-call-parser', 'inkling',
-        '--language-model-only', '--safetensors-load-strategy', 'eager', '--speculative-config', json.dumps(SPEC),
+        '--limit-mm-per-prompt', json.dumps({'image': IMAGE_LIMIT}),
+        '--safetensors-load-strategy', 'eager', '--speculative-config', json.dumps(SPEC),
     ]
 
 
@@ -115,6 +120,18 @@ def http_json(port, endpoint, payload=None, timeout=10):
         return json.load(resp)
 
 
+def smoke_png():
+    """Generate the solid red PNG used by the vision smoke test."""
+    width = height = 64
+    scanlines = (b'\x00' + bytes((220, 20, 20)) * width) * height
+
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+    header = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', header) + chunk(b'IDAT', zlib.compress(scanlines)) + chunk(b'IEND', b'')
+
+
 def smoke(port, wait):
     until = time.monotonic() + wait
     while True:
@@ -136,7 +153,18 @@ def smoke(port, wait):
     if (result.get('model') != MODEL or c.get('finish_reason') != 'stop'
             or (c['message'].get('content') or '').strip() != 'READY'):
         raise ValueError('chat contract failed (expected exact READY with stop finish)')
-    print(f'SMOKE OK: {MODEL}, max_model_len={CONTEXT}, response=READY')
+    url = 'data:image/png;base64,' + base64.b64encode(smoke_png()).decode('ascii')
+    result = http_json(port, '/v1/chat/completions', {
+        'model': MODEL, 'messages': [{'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': url}},
+            {'type': 'text', 'text': 'What single primary color is this image? Reply in one word.'},
+        ]}], 'temperature': 0, 'max_tokens': 128, 'reasoning_effort': 'low',
+    }, timeout=60)
+    c = result['choices'][0]
+    color = (c['message'].get('content') or '').strip().lower().removesuffix('.')
+    if result.get('model') != MODEL or c.get('finish_reason') != 'stop' or color != 'red':
+        raise ValueError('vision contract failed (expected red with stop finish)')
+    print(f'SMOKE OK (text + vision): {MODEL}, max_model_len={CONTEXT}, response=READY, color=red')
 
 
 def main():

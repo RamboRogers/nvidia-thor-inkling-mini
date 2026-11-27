@@ -43,19 +43,26 @@ class BenchmarkTests(unittest.TestCase):
         self.assertAlmostEqual(cold['prompt_tokens'] / cold['cold_ttft_s'], 3278.8, delta=0.1)
 
     def test_lan_mean_capacity_and_residency(self):
-        data = receipt('v6-lan.json')
-        suite = data['lan_c1_medium']
-        self.assertEqual(set(suite['tasks']), set(bench.PROMPTS_C1))
-        self.assertEqual(round(statistics.mean(task['decode_tps'] for task in suite['tasks'].values()), 2), 70.46)
-        self.assertEqual(suite['mean_decode_tps'], 70.46)
-        self.assertEqual(set(data['stages']), {'smoke', 'code', 'c4', 'mixed', 'long'})
-        self.assertTrue(all(stage['status'] == 'passed' for stage in data['stages'].values()))
-        long = data['stages']['long']
-        self.assertEqual(long['prompt_tokens'] + long['reserved_output_tokens'], data['context_limit'])
-        self.assertEqual(long['needles_verified'], 3)
-        for name in ('c4', 'mixed'):
-            stage = data['stages'][name]
-            self.assertEqual((stage['peak_running'], stage['lanes_passed']), (4, 4))
+        text = receipt('v6-lan.json')
+        vision = receipt('v6-vision-lan.json')
+        self.assertEqual(vision['image_id'], text['image_id'])
+        self.assertEqual(vision['image_limit_per_prompt'], 16)
+        for data, mean in [(text, 70.46), (vision, 70.16)]:
+            with self.subTest(mean=mean):
+                suite = data['lan_c1_medium']
+                self.assertEqual(set(suite['tasks']), set(bench.PROMPTS_C1))
+                self.assertEqual({task['completion_tokens'] for task in suite['tasks'].values()}, {512})
+                self.assertEqual(round(statistics.mean(task['decode_tps'] for task in suite['tasks'].values()), 2), mean)
+                self.assertEqual(suite['mean_decode_tps'], mean)
+                self.assertEqual(set(data['stages']), {'smoke', 'code', 'c4', 'mixed', 'long'})
+                self.assertTrue(all(stage['status'] == 'passed' for stage in data['stages'].values()))
+                long = data['stages']['long']
+                self.assertEqual(long['prompt_tokens'] + long['reserved_output_tokens'], data['context_limit'])
+                self.assertEqual(data['context_limit'], 262144)
+                self.assertEqual(long['needles_verified'], 3)
+                for name in ('c4', 'mixed'):
+                    stage = data['stages'][name]
+                    self.assertEqual((stage['peak_running'], stage['lanes_passed']), (4, 4))
 
     def test_stream_complete_and_truncated(self):
         events = [

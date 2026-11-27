@@ -4,9 +4,9 @@
 
 By **[Matthew Rogers](https://github.com/RamboRogers)** · [@matthewrogers on X](https://x.com/matthewrogers)
 
-**75.44 output tok/s** single-user with reasoning off, **70.46 tok/s** with medium reasoning over the LAN, and **104.67 tok/s** aggregate with four active requests. Measured on one Jetson AGX Thor; see [workloads and raw timing records](benchmarks/README.md). The same serving profile passed a **262,144-token context reservation** and separate **four-resident-request** tool workflows. Those are two tests, not four simultaneous full-context requests.
+**Native vision is enabled by default**, with up to **16 images per prompt**. On one Jetson AGX Thor, the vision-enabled profile averaged **70.16 output tok/s** on four text tasks with medium reasoning over the LAN. It also passed a **262,144-token context reservation** and separate **four-resident-request** tool workflows, not four simultaneous full-context requests. The earlier text-only loopback run measured **75.44 tok/s** single-user with reasoning off and **104.67 tok/s** aggregate at C4. See [workloads and timing records](benchmarks/README.md).
 
-This repo rebuilds the text-only runtime from pinned public sources. It contains the vLLM patch, Docker launch settings, a checksum-verified model downloader, and the benchmark client. No model weights, private images, or precompiled extensions are required from this repo.
+This repo rebuilds the text-and-vision runtime from pinned public sources. It contains the vLLM patch, Docker launch settings, a checksum-verified model downloader, and the benchmark client. No model weights, private images, or precompiled extensions are required from this repo.
 
 ## Quick start
 
@@ -24,6 +24,8 @@ python3 serve.py smoke --wait 600
 ```
 
 `build.py` pulls the exact ARM64 vLLM image, fetches pinned CUDA sources, and compiles two SM110a extensions with one worker in a network-disabled, CPU-only container. The final Docker build only copies checked sources, extensions, and notices. The rebuilt image has a different Docker image ID from the original benchmark image; see [provenance and validation](FORMULA.md).
+
+**Upgrading from the text-only launcher?** Use the same v6 image and model snapshot. Stop and remove the container created by the previous quick start, then run the updated `serve.py start` and `serve.py smoke --wait 600`. Restarting an existing container does not apply the new flags.
 
 ```bash
 # Inspect the full Docker command without starting anything.
@@ -44,6 +46,29 @@ docker stop inkling-thor-v6 && docker rm inkling-thor-v6
 
 No API key is needed on loopback. The launcher binds to `127.0.0.1`; for another machine, use an SSH tunnel or an authenticated proxy instead of publishing the raw port. If you use `--port` on `serve.py start`, pass the same port to `smoke` and `bench.py`. A cold first start may take several minutes; check `docker logs -f inkling-thor-v6` while it warms up. Docker automatic restart is intentionally disabled.
 
+## Send an image
+
+The quick-start smoke test checks both text and a generated PNG. To try your own PNG, replace `image.png` below. Add one `image_url` content item per image for multi-image prompts.
+
+```bash
+python3 - image.png <<'PY' | curl --fail-with-body -sS \
+  http://127.0.0.1:8010/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary @-
+import base64, json, sys
+from pathlib import Path
+
+png = base64.b64encode(Path(sys.argv[1]).read_bytes()).decode('ascii')
+print(json.dumps({
+    'model': 'inkling-mini',
+    'messages': [{'role': 'user', 'content': [
+        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + png}},
+        {'type': 'text', 'text': 'Describe this image in one sentence.'},
+    ]}],
+    'reasoning_effort': 'low', 'max_tokens': 512,
+}))
+PY
+```
+
 ## The formula in one table
 
 | Component | Measured profile |
@@ -52,6 +77,7 @@ No API key is needed on loopback. The launcher binds to `127.0.0.1`; for another
 | Engine | CUDA 13.0 vLLM `0.1.dev25855+g7cb5dae22` with the [Thor source patch](patches/vllm-thor.patch) |
 | Context and scheduling | 262,144 total tokens/request · 4 scheduled sequences · 2,048 batched tokens |
 | KV cache | 28 GiB BF16; startup reported 547,353 tokens shared across requests |
+| Vision | Native 23-layer `inkling2_vision` encoder; limit of 16 images per prompt |
 | Speculation | Bundled probabilistic DSpark, 7 draft tokens, INT8 hot vocabulary, adaptive verify cap |
 | Thor tuning | BF16x LM head, global-only FA4 prefill, SM110 split cap, narrowed warmup |
 

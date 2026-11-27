@@ -1,8 +1,8 @@
-# Thor benchmark results · 2026-11-26
+# Thor benchmark results · 2026-11-26 (US/Eastern)
 
-The data comes from a single Jetson AGX Thor in MAXN mode. The default result to cite is the **baked v6** run, not the fastest tuning run or one unusually fast prompt.
+The data comes from a single Jetson AGX Thor in MAXN mode. Use the baked v6 row for the historical text-only loopback comparison and the vision-enabled LAN record for the current serving profile.
 
-## Controlled loopback results
+## Text-only controlled loopback results
 
 | Profile | C1 decode · none | C1 decode · medium | Cold-prefix input rate · ~32K target | C4 aggregate output |
 |---|---:|---:|---:|---:|
@@ -12,7 +12,22 @@ The data comes from a single Jetson AGX Thor in MAXN mode. The default result to
 
 The baked v6 cold sample processed **34,932 measured prompt tokens** in **10.654 s** to first streamed activity. Input rate is native prompt tokens divided by that wall time; it is not an isolated GPU kernel rate. The C4 result used **2,048 completion tokens** over **19.566 s** and observed 4 running requests in vLLM metrics. That column is a batch rate, **not** a per-user rate. These are profile comparisons, not one-variable ablations. The full tuning run did not improve every metric; it produced 1,920 completion tokens in its C4 batch.
 
-## LAN qualification of the production v6 profile
+## Vision-enabled LAN qualification
+
+[Sanitized timing record](results/v6-vision-lan.json), captured November 27 UTC. This used the same v6 image with native vision enabled; a Qwen3.5 4B sidecar and Nemotron embedding service remained resident. The **70.16 tok/s** mean is from four **text-input** samples of 512 completion tokens each at `reasoning_effort=medium`. It is not image decode throughput. The host reported **48.25 GiB** `MemAvailable` after qualification.
+
+| Task | First streamed activity | Decode output | End-to-end output |
+|---|---:|---:|---:|
+| Code | 0.236 s | 61.09 tok/s | 59.75 tok/s |
+| Text | 0.168 s | 62.41 tok/s | 61.51 tok/s |
+| Prose | 0.239 s | 62.37 tok/s | 61.19 tok/s |
+| Math | 0.244 s | 94.77 tok/s | 91.52 tok/s |
+
+**All five LAN stages passed.** Short text smoke median first-visible latency was **0.933 s**; functional code passed. Short C4 tools and mixed C4 each passed **4/4** with four running requests observed. The short tool batch had **3.259 s** median workflow latency to first visible answer; the mixed batch's short lanes had **12.818 s**. The separate long text request reserved **196,608 input + 65,536 output tokens**, recovered **3/3 needles**, and generated **235 completion tokens** (first reasoning **65.42 s**, first visible **71.06 s**).
+
+**Separate vision probes** passed for a solid color, left/right spatial split (**0.97 s**), rendered OCR (**0.65 s**), multi-image input (**1.18 s**), and a **1920 × 1080** image (**2.17 s**). These are individual smoke-request timings, not a sustained throughput benchmark or a validation at the 16-image cap.
+
+## Historical text-only LAN qualification
 
 [Sanitized timing record](results/v6-lan.json). A Qwen3.5 4B sidecar and Nemotron embedding service remained resident for this test. The **70.46 tok/s** LAN figure is a mean across four separate 512-completion-token samples with `reasoning_effort=medium`, not a per-task minimum. Native completion counts can include reasoning tokens.
 

@@ -17,9 +17,16 @@
 | Attention | Use `tml_fa4` for **global** prefill layers, the SM110 decode split cap, BF16 KV, and the qualified warmup configuration. See [the launch arguments](serve.py) for the exact switches. |
 | OpenAI interface | Use the `inkling` reasoning and tool parsers with `--enable-auto-tool-choice`. A named-tool finish correction and a model-specific explicit `none` shim are included in the patch. |
 
-For deterministic short jobs, `reasoning_effort="none"` was tested at `temperature=0`. For sampled chat or tools, prefer `low` or `medium`. Combining `none` with a high temperature can sample unwanted opening tokens in this implementation. The project qualifies text and tool use, not vision or a different GPU architecture. A stock DGX Spark image requiring CUDA 13.2 was rejected by the tested R580 host before execution; don't disable the NVIDIA driver check.[4]
+For deterministic short jobs, `reasoning_effort="none"` was tested at `temperature=0`. For sampled chat or tools, prefer `low` or `medium`. Combining `none` with a high temperature can sample unwanted opening tokens in this implementation. This recipe targets Thor SM110. A stock DGX Spark image requiring CUDA 13.2 was rejected by the tested R580 host before execution; don't disable the NVIDIA driver check.[4]
 
 The 28 GiB cache is shared, not one allocation per request. At the context boundary, `prompt_tokens + reserved_output_tokens` must fit the 262,144-token limit. A 65,536-token allowance is not a claim that a test generated that many tokens. Start a clean benchmark on an idle server; changing cache precision, power mode, build/runtime version, or competing work can change both speed and available context.
+
+## Native vision on Thor
+
+- Use the same checkpoint and image. Remove `--language-model-only` and pass `--limit-mm-per-prompt '{"image": 16}'`, as [the launcher](serve.py) now does. The 16-image setting is an input limit, not a claim that a worst-case 16-image batch was benchmarked. Image tokens count toward the context limit.
+- The bundled `inkling2_vision` encoder is a 23-layer BF16 ViT with 318.3M parameters (about 607 MiB of weights). The [runtime patch](patches/vllm-thor.patch) selects FlashAttention 2 for vision on SM110 rather than the Hopper-only FA3 path. This is separate from the global text-prefill FA4 optimization.
+- The measured engine loaded 19.26 GiB of weights and reported a 2,704-token image-embedding cache (0.01 GiB, carved from the KV allocation). Reported usable BF16 KV capacity remained **547,353 tokens** with the same 28 GiB allocation.
+- Direct OpenAI-compatible requests, LiteLLM, and Hermes passed image probes. For a Hermes OpenAI-compatible provider, declare `supports_vision: true` on the `inkling-mini` model entry so the client routes image input natively. See the [public request example](README.md#send-an-image) and [qualification results](benchmarks/README.md#vision-enabled-lan-qualification).
 
 ## Attribution and licenses
 
@@ -29,7 +36,7 @@ The 28 GiB cache is shared, not one allocation per request. At the context bound
 
 ## What was verified
 
-The public source recipe built on Jetson AGX Thor from the pinned base and donor, with both freshly compiled SM110a extensions. A GPU canary loaded both from the rebuilt image, round-tripped a 1,024 × 4,096 BF16 weight matrix bit-exactly, and matched a reference projection with each kernel. The smoke client also passed against the unchanged running benchmark profile. The rebuilt image was not cold-loaded with the full checkpoint for this packaging test; the published speed and capacity figures are measurements of the original image, not the rebuild.
+The public source recipe built on Jetson AGX Thor from the pinned base and donor, with both freshly compiled SM110a extensions. A GPU canary loaded both from the rebuilt image, round-tripped a 1,024 × 4,096 BF16 weight matrix bit-exactly, and matched a reference projection with each kernel. The updated text-and-vision smoke client passed against the running vision-enabled deployment, without restarting it. The rebuilt image was not cold-loaded with the full checkpoint for this packaging test; the published speed and capacity figures are measurements of the original image, not the rebuild.
 
 ## Sources
 

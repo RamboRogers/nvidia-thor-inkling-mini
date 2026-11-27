@@ -1,0 +1,53 @@
+{
+  "qualified_utc": "2026-11-27T03:53:29.520178+00:00",
+  "model": "inkling-mini",
+  "image_id": "sha256:11add92a9d85905a3c990ef6ce99c1a9656a367e715d324ee5675fde727bec75",
+  "context_limit": 262144,
+  "image_limit_per_prompt": 16,
+  "concurrent_residents": ["Qwen3.5 4B NVFP4", "Nemotron embedding"],
+  "host_mem_available_kib": 50593040,
+  "stages": {
+    "smoke": {
+      "status": "passed",
+      "median_ttft_s": 0.932939916,
+      "e2e_tps": [56.27, 57.78, 62.26]
+    },
+    "code": {
+      "status": "passed",
+      "e2e_tps": 74.61,
+      "ttft_s": 1.196,
+      "behavior_verified": true
+    },
+    "c4": {
+      "status": "passed",
+      "peak_running": 4,
+      "median_workflow_ttft_s": 3.259,
+      "lanes_passed": 4
+    },
+    "mixed": {
+      "status": "passed",
+      "peak_running": 4,
+      "short_lane_median_workflow_ttft_s": 12.818,
+      "lanes_passed": 4
+    },
+    "long": {
+      "status": "passed",
+      "prompt_tokens": 196608,
+      "reserved_output_tokens": 65536,
+      "first_reasoning_s": 65.42,
+      "ttft_s": 71.06,
+      "e2e_s": 71.43,
+      "completion_tokens": 235,
+      "needles_verified": 3
+    }
+  },
+  "lan_c1_medium": {
+    "tasks": {
+      "code": {"completion_tokens": 512, "decode_tps": 61.09, "e2e_tps": 59.75, "ttft_any_s": 0.2357},
+      "text": {"completion_tokens": 512, "decode_tps": 62.41, "e2e_tps": 61.51, "ttft_any_s": 0.1683},
+      "prose": {"completion_tokens": 512, "decode_tps": 62.37, "e2e_tps": 61.19, "ttft_any_s": 0.2391},
+      "math": {"completion_tokens": 512, "decode_tps": 94.77, "e2e_tps": 91.52, "ttft_any_s": 0.2438}
+    },
+    "mean_decode_tps": 70.16
+  }
+}
